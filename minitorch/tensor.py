@@ -425,3 +425,26 @@ class Tensor:
 
     def layernorm(self, gamma: Tensor, beta: Tensor) -> Tensor:
       return LayerNorm.apply(self, gamma, beta)
+  
+  
+    def gather(self, dim: int, index: Tensor) -> Tensor:
+        def one_hot(input: Tensor, num_classes: int) -> Tensor:
+            """Takes a Tensor containing indices of shape (*) and returns a tensor of shape (*, num_classes) 
+            that contains zeros except a 1 where the index of last dimension matches the corresponding value of the input tensor.
+            This is analogous to torch.nn.functional.one_hot (which contains helpful examples you may want to play around with)
+
+            Hint: You may want to use a combination of np.eye, tensor_from_numpy, 
+            """
+            return tensor_from_numpy(
+                        np.eye(num_classes)[input.to_numpy().astype(int)], 
+                        backend=input.backend
+                    )
+        
+        index_one_hot = one_hot(index, self.shape[dim])
+        index_one_hot = index_one_hot.view(
+            index.shape[0], index.shape[1], index_one_hot.shape[3]
+        )
+        data_multiplied = Mul.apply(self, index_one_hot)
+        result = Sum.apply(data_multiplied, self._ensure_tensor(dim))
+        return result
+            

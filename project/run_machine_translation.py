@@ -7,9 +7,6 @@ import json
 import random
 import datasets
 import numpy as np
-import argparse
-from distutils.util import strtobool
-
 from sacrebleu.metrics import BLEU
 from transformers import AutoTokenizer
 from tokenizers import ByteLevelBPETokenizer
@@ -17,6 +14,7 @@ from tokenizers import ByteLevelBPETokenizer
 import minitorch
 from minitorch import DecoderLM
 from minitorch.cuda_kernel_ops import CudaKernelOps
+from minitorch.tensor import tensor_from_numpy
 
 
 def get_dataset(dataset_name, model_max_length):
@@ -24,7 +22,7 @@ def get_dataset(dataset_name, model_max_length):
     Obtrain IWSLT (de-en) dataset.
     """
     dataset = {
-        split: datasets.load_dataset(dataset_name, split=split)['translation']
+        split: datasets.load_dataset(dataset_name, split=split, use_auth_token=True)['translation']
         for split in ['train', 'validation', 'test']
     }
     src_key, tgt_key = 'de', 'en'
@@ -32,16 +30,17 @@ def get_dataset(dataset_name, model_max_length):
     dataset = {
         split: [
             example for example in dataset[split]
-            if len(example[src_key].split()) + len(example[tgt_key].split()) < model_max_length
+            if len(example[src_key].split()) + len(
+                example[tgt_key].split()) < model_max_length
         ] for split in dataset.keys()
     }
 
-    dataset['test'] = dataset['test'][:100]             # 6750
+    dataset['test'] = dataset['test'][:100]  # 6750
 
     print(json.dumps(
         {'data_size': {split: len(dataset[split]) for split in dataset.keys()}},
         indent=4))
-
+    
     return dataset, src_key, tgt_key
 
 
@@ -112,31 +111,81 @@ def collate_batch(
     between the source (weight = 0) and target (weight = 1) tokens for loss
     """
     token_ids, tgt_token_mask = [], []
+    rejected_token_ids = []
+    rejected_tgt_token_mask = []
+    max_length = model_max_length
     pad_token_id = tokenizer.vocab['<pad>']
     for example in examples:
-        # token_ids_src = <de_token_ids> + <de_eos_id>
         token_ids_src = tokenizer(
             f'{example[src_key]}<eos_{src_key}>')['input_ids']
-        # token_ids_tgt = <en_token_ids> + <en_eos_id>
         token_ids_tgt = tokenizer(
             f'{example[tgt_key]}<eos_{tgt_key}>')['input_ids']
 
-        # COPY FROM ASSIGN2_5
-        raise NotImplementedError("Collate Function Not Implemented Yet")
+        chosen_token_ids = token_ids_src + token_ids_tgt
+        chosen_tgt_token_mask = (
+                [0] * len(token_ids_src) + [1] * len(token_ids_tgt))
+        chosen_token_ids = chosen_token_ids[:max_length]
+        chosen_tgt_token_mask = chosen_tgt_token_mask[:max_length]
+        pad_ids = [pad_token_id] * (max_length - len(chosen_token_ids))
+        
+        shuffled_token_ids_tgt = token_ids_tgt.copy()
+        random.shuffle(shuffled_token_ids_tgt)
+        reject_token_ids = token_ids_src + shuffled_token_ids_tgt
+        reject_tgt_token_mask = (
+                [0] * len(token_ids_src) + [1] * len(shuffled_token_ids_tgt))
+        reject_token_ids = reject_token_ids[:max_length]
+        reject_tgt_token_mask = reject_tgt_token_mask[:max_length]
+        
+        token_ids.append(chosen_token_ids + pad_ids)
+        tgt_token_mask.append(chosen_tgt_token_mask + [0] * len(pad_ids))
+        
+        rejected_token_ids.append(reject_token_ids + pad_ids)
+        rejected_tgt_token_mask.append(reject_tgt_token_mask + [0] * len(pad_ids))
 
-    # COPY FROM ASSIGN2_5
-    raise NotImplementedError("Collate Function Not Implemented Yet")
+    # TODO: make examples in a 1d list, provide shape to initialize minitorch.Tensor
+    token_ids = np.array(token_ids)
+    tgt_token_mask = np.array(tgt_token_mask)
+    
+    rejected_token_ids = np.array(rejected_token_ids)
+    rejected_tgt_token_mask = np.array(rejected_tgt_token_mask)
+
+    input_ids = token_ids[:, :-1]
+    labels    = token_ids[:, 1:]
+    label_token_weights = tgt_token_mask[:, 1:]
+    
+    rejected_input_ids = rejected_token_ids[:, :-1]
+    rejected_labels    = rejected_token_ids[:, 1:]
+    rejected_label_token_weights = rejected_tgt_token_mask[:, 1:]
+
+    input_ids = minitorch.tensor_from_numpy(input_ids, backend=backend)
+    labels    = minitorch.tensor_from_numpy(labels, backend=backend)
+    label_token_weights = minitorch.tensor_from_numpy(label_token_weights, backend=backend)
+    
+    rejected_input_ids = minitorch.tensor_from_numpy(rejected_input_ids, backend=backend)
+    rejected_labels    = minitorch.tensor_from_numpy(rejected_labels, backend=backend)
+    rejected_label_token_weights = minitorch.tensor_from_numpy(rejected_label_token_weights, backend=backend)
+    
+    # input_ids = token_ids[:, :-1].tolist()
+    # labels    = token_ids[:, 1:].tolist()
+    # label_token_weights = tgt_token_mask[:, 1:].tolist()
+
+    # input_ids = minitorch.tensor(input_ids, backend=backend)
+    # labels    = minitorch.tensor(labels, backend=backend)
+    # label_token_weights = minitorch.tensor(label_token_weights, backend=backend)
 
     return {
-        'input_ids': minitorch.zeros((len(examples), model_max_length)),
-        'labels': minitorch.zeros((len(examples), model_max_length)),
-        'label_token_weights': minitorch.zeros((len(examples), model_max_length))
+        'input_ids': input_ids,
+        'labels': labels,
+        'label_token_weights': label_token_weights,
+        'rejected_input_ids': rejected_input_ids,
+        'rejected_labels': rejected_labels,
+        'rejected_label_token_weights': rejected_label_token_weights
     }
 
 
-def loss_fn(batch, model):
+def loss_fn(batch, model, ref_model):
     """
-    The MLE loss for a batch.
+    The DPO loss for a batch.
 
     Parameters:
     - batch: The result of collate_fn, a dict with "input_ids", "labels", and "label_token_weights".
@@ -145,30 +194,118 @@ def loss_fn(batch, model):
     Returns:
     - A scalar loss value for this batch, averaged across all target tokens.
     """
-
-    idx = batch['input_ids']
-    idx.requires_grad_(True)
     
-    logits = model(idx=idx)
-    batch_size, seq_len, vocab_size = logits.shape
+    chosen_input_ids = batch['input_ids']
+    chosen_input_ids.requires_grad_(True)
+    chosen_labels = batch['labels']
+    chosen_labels.requires_grad_(True)
+    chosen_label_token_weights = batch['label_token_weights']
+    chosen_label_token_weights.requires_grad_(True)
     
-    # COPY FROM ASSIGN2_5
-    raise NotImplementedError("Loss Function Not Implemented Yet")
+    rejected_input_ids = batch['rejected_input_ids']
+    rejected_input_ids.requires_grad_(True)
+    rejected_labels = batch['rejected_labels']
+    rejected_labels.requires_grad_(True)
+    rejected_label_token_weights = batch['rejected_label_token_weights']
+    rejected_label_token_weights.requires_grad_(True)
+    
+    chosen_logits = model(idx=chosen_input_ids)
+    chosen_logp = minitorch.nn.softmax(chosen_logits, dim=-1)
+    chosen_labels_unsqueeze = chosen_labels.view(
+        chosen_labels.shape[0], chosen_labels.shape[1], 1
+    )
+    chosen_logp_unsqueeze = chosen_logp.gather(2, chosen_labels_unsqueeze)
+    chosen_logp = chosen_logp_unsqueeze.view(
+        chosen_labels.shape[0], chosen_labels.shape[1]
+    )
+    
+    rejected_logits = model(idx=rejected_input_ids)
+    rejected_logp = minitorch.nn.softmax(rejected_logits, dim=-1)
+    rejected_labels_unsqueeze = rejected_labels.view(
+        rejected_labels.shape[0], rejected_labels.shape[1], 1
+    )
+    rejected_logp_unsqueeze = rejected_logp.gather(2, rejected_labels_unsqueeze)
+    rejected_logp = rejected_logp_unsqueeze.view(
+        rejected_labels.shape[0], rejected_labels.shape[1]
+    )
+    
+    ref_chosen_logits = ref_model(idx=chosen_input_ids)
+    ref_chosen_logp = minitorch.nn.softmax(ref_chosen_logits, dim=-1)
+    ref_chosen_logp_unsqueeze = ref_chosen_logp.gather(2, chosen_labels_unsqueeze)
+    ref_chosen_logp = ref_chosen_logp_unsqueeze.view(
+        chosen_labels.shape[0], chosen_labels.shape[1]
+    )
+    
+    ref_rejected_logits = ref_model(idx=rejected_input_ids)
+    ref_rejected_logp = minitorch.nn.softmax(ref_rejected_logits, dim=-1)
+    ref_rejected_logp_unsqueeze = ref_rejected_logp.gather(2, rejected_labels_unsqueeze)
+    ref_rejected_logp = ref_rejected_logp_unsqueeze.view(
+        rejected_labels.shape[0], rejected_labels.shape[1]
+    )
+    
+    chosen_logp = chosen_logp * chosen_label_token_weights
+    chosen_logp = chosen_logp.sum() / chosen_label_token_weights.sum()
+    rejected_logp = rejected_logp * rejected_label_token_weights
+    rejected_logp = rejected_logp.sum() / rejected_label_token_weights.sum()
+    ref_chosen_logp = ref_chosen_logp * chosen_label_token_weights
+    ref_chosen_logp = ref_chosen_logp.sum() / chosen_label_token_weights.sum()
+    ref_rejected_logp = ref_rejected_logp * rejected_label_token_weights
+    ref_rejected_logp = ref_rejected_logp.sum() / rejected_label_token_weights.sum()
+    
+    # DPO loss
+    logratios = chosen_logp - rejected_logp
+    ref_logratios = ref_chosen_logp - ref_rejected_logp
+    logits = logratios - ref_logratios
+    beta = 0.1
+    loss = -(beta * logits).sigmoid().log()
+    loss = loss.mean()
+
+    # # idx = batch['input_ids']
+    # # idx.requires_grad_(True)
+    # # print("getting into loss_fn")
+    # logits = model(idx=idx)
+    # # print("finish prediction")
+    # bs, l, c = logits.shape
+    # logits = logits.view(bs * l, c)
+    # targets = batch['labels'].view(bs * l)
+    # label_token_weights = batch['label_token_weights'].view(bs * l)
+
+    # targets.requires_grad_(True)
+    # # print("start calculating loss")
+    # # import pdb
+    # # pdb.set_trace()
+    # loss = minitorch.nn.softmax_loss(
+    #     logits=logits,
+    #     target=targets
+    # )
+
+    return loss
 
 
-def train(model, optimizer, examples, n_samples, collate_fn, batch_size, desc):
+def train(model, ref_model, optimizer, examples, n_samples, collate_fn, batch_size, desc):
+    """
+    Trains the model on the provided examples.
+
+    Parameters:
+    - model: The model to be trained.
+    - optimizer: The optimizer used for updating the model's parameters.
+    - examples: The dataset examples used for training.
+    - n_samples: The random samples to train from "examples".
+    - collate_fn: The function to collate data examples into batches.
+    - batch_size: The number of examples in each batch.
+    - desc: Description for the training process (used in progress bars).
+    """
     model.train()
     random.shuffle(examples)
     examples = examples[:n_samples]
 
     for i in (prog_bar := tqdm.trange(
             0, len(examples), batch_size, desc=f'Training ({desc})')):
-        
         batch = collate_fn(examples=examples[i:i + batch_size])
-        
+
         t0 = time.time()
         optimizer.zero_grad()
-        loss = loss_fn(batch=batch, model=model)
+        loss = loss_fn(batch=batch, model=model, ref_model=ref_model)
         t1 = time.time()
 
         loss.backward()
@@ -177,9 +314,9 @@ def train(model, optimizer, examples, n_samples, collate_fn, batch_size, desc):
         optimizer.step()
         t3 = time.time()
 
-        # print(f"Forward: {t1 - t0}")
-        # print(f"Backward: {t2 - t1}")
-        # print(f"Opt.step: {t3 - t2}")
+        print(f"Forward: {t1 - t0}")
+        print(f"Backward: {t2 - t1}")
+        print(f"Opt.step: {t3 - t2}")
 
         batch_time = time.time() - t0
         prog_bar.set_postfix(
@@ -188,26 +325,136 @@ def train(model, optimizer, examples, n_samples, collate_fn, batch_size, desc):
             lr=optimizer.lr)
 
 
-def parse_args():
-    def str2bool(x):
-        return bool(strtobool(x))
-        
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--use-fused-kernel', type=str2bool, default=False)
-    return parser.parse_args()
+def evaluate_loss(model, examples, batch_size, collate_fn, desc):
+    """
+    Evaluates the model on the provided examples and computes the average loss.
+
+    Parameters:
+    - model: The model to be evaluated.
+    - examples: The dataset examples used for evaluation.
+    - batch_size: The number of examples in each batch.
+    - collate_fn: The function to collate data examples into batches.
+    - desc: Description for the evaluation process (used in progress bars).
+
+    Returns:
+    - The average loss computed over all batches.
+    """
+    model.eval()
+    losses = []
+
+    for i in (prog_bar := tqdm.trange(
+        0, len(examples), batch_size, desc=f'Evaluating ({desc})')):
+        batch = collate_fn(examples=examples[i:i + batch_size])
+        loss = loss_fn(batch=batch, model=model)
+
+        losses.append(loss.item())
+        prog_bar.set_postfix(loss=loss.item())
+
+    return np.mean(losses)
+
+
+def generate(model,
+             examples,
+             src_key,
+             tgt_key,
+             tokenizer,
+             model_max_length,
+             backend,
+             desc):
+    """
+    Generates target sequences for the given source sequences using the model, based on argmax decoding.
+    Note that it runs generation on examples one-by-one instead of in a batched manner.
+
+    Parameters:
+    - model: The model used for generation.
+    - examples: The dataset examples containing source sequences.
+    - src_key: The key for accessing source texts in the examples.
+    - tgt_key: The key for accessing target texts in the examples.
+    - tokenizer: The tokenizer used for encoding texts.
+    - model_max_length: The maximum sequence length the model can handle.
+    - backend: The backend of minitorch tensors.
+    - desc: Description for the generation process (used in progress bars).
+
+    Returns:
+    - A list of generated target sequences.
+    """
+
+    model.eval()
+    gen_sents = []
+    for example in tqdm.tqdm(examples, desc=f'Generating {desc}'):
+        # Run generation for every single example
+
+        token_ids = tokenizer(f'{example[src_key]}<eos_{src_key}>')['input_ids']
+        len_src = len(token_ids)
+
+        while len(token_ids) <= model_max_length:
+            # BEGIN ASSIGN2_2
+            # TODO
+            # run the model with current token_ids, and predict the next token (gen_id)
+            # hint: obtain the logits of next token, and take the argmax.
+            token_ids_np = np.array([token_ids])
+            input_tensor = tensor_from_numpy(token_ids_np, backend=backend)
+            logits = model(idx=input_tensor)
+            logits = logits.to_numpy()[:, -1]
+            gen_id = np.argmax(logits, axis=-1).item()
+            # END ASSIGN2_2
+
+            if gen_id == tokenizer.vocab[f'<eos_{tgt_key}>']:
+                break
+            else:
+                token_ids.append(gen_id)
+
+        gen_sents.append(tokenizer.decode(token_ids[len_src:]))
+
+    return gen_sents
+
+
+def evaluate_bleu(examples, gen_sents, tgt_key):
+    """
+    Evaluates the BLEU score for generated sentences against the target sentences in the examples.
+
+    Parameters:
+    - examples: The dataset examples used for evaluation.
+    - gen_sents: The generated sentences to be evaluated.
+    - tgt_key: The key for accessing target texts in the examples.
+
+    Returns:
+    - A dictionary containing the BLEU score.
+    """
+    print("BLEU score:", BLEU().corpus_score(
+        hypotheses=gen_sents,
+        references=[[example[tgt_key] for example in examples]]).score)
+    return {
+        'bleu': BLEU().corpus_score(
+            hypotheses=gen_sents,
+            references=[[example[tgt_key] for example in examples]]).score
+    }
 
 
 def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
          model_max_length=40,
-         n_epochs=1,
+         n_epochs=20,
          batch_size=128,
          learning_rate=0.02,
          samples_per_epoch=20000,
          n_vocab=10000,
          n_embd=256,
          seed=11111):
-    args = parse_args()
-             
+    """
+    The main function to train and evaluate the model on a specified dataset.
+
+    Parameters:
+    - dataset_name: The name of the dataset to be used.
+    - model_max_length: The maximum sequence length the model can handle.
+    - n_epochs: The number of training epochs.
+    - batch_size: The number of examples in each batch.
+    - learning_rate: The learning rate for the optimizer.
+    - samples_per_epoch: Samples from the training dataset every epoch.
+    - n_vocab: The vocabulary size of the BPE tokenizer.
+    - n_embd: The embedding dimension.
+    - seed: Random seed.
+    """
+
     np.random.seed(seed)
     random.seed(seed)
 
@@ -217,18 +464,18 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
     backend = minitorch.TensorBackend(CudaKernelOps)
 
     config = {
-        'n_vocab'     : n_vocab,  # vocab_size
-        'n_embd'      : n_embd,   # n_embed
-        'n_head'      : 8,    # n_head
-        'n_positions' : model_max_length,  # n_ctx == n_positions
+        'n_vocab': n_vocab,  # vocab_size
+        'n_embd': n_embd,  # n_embed
+        'n_head': 8,  # n_head
+        'n_positions': model_max_length,  # n_ctx == n_positions
         # 'n_layer'     : 4,    # n_layer
-        'p_dropout'   : 0.1,  # x_pdrop
-        'ln_eps'      : 1e-5, # layer_norm_epsilon
-        'backend'     : backend,
-        'use_fused_kernel': args.use_fused_kernel
+        'p_dropout': 0.1,  # x_pdrop
+        'ln_eps': 1e-5,  # layer_norm_epsilon
+        'backend': backend
     }
 
     model = DecoderLM(**config)
+    ref_model = DecoderLM(**config)
     optimizer = minitorch.Adam(model.parameters(), lr=learning_rate)
 
     dataset, src_key, tgt_key = get_dataset(
@@ -248,18 +495,52 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
         tokenizer=tokenizer,
         model_max_length=model_max_length,
         backend=backend)
-    
+
     for epoch_idx in range(n_epochs):
         desc = f'epoch {epoch_idx} / {n_epochs}'
 
         train(
             model=model,
+            ref_model=ref_model,
             optimizer=optimizer,
             examples=dataset['train'],
             n_samples=samples_per_epoch,
             batch_size=batch_size,
             collate_fn=collate_fn,
             desc=desc)
+
+        validation_loss = evaluate_loss(
+            model=model,
+            examples=dataset['validation'],
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            desc=desc)
+
+        print(f'Epoch {epoch_idx}: Validation Loss = {validation_loss}')
+
+        gen_sents = generate(
+            model=model,
+            examples=dataset['test'],
+            src_key=src_key,
+            tgt_key=tgt_key,
+            tokenizer=tokenizer,
+            model_max_length=model_max_length,
+            backend=backend,
+            desc=desc)
+
+        gen_examples = []
+        for example, gen_sent in zip(dataset['test'], gen_sents):
+            gen_examples.append({'example': example, 'gen': gen_sent})
+        json.dump(gen_examples, open(
+            f'{workdir}/gen_epoch{epoch_idx}.json', 'w'), indent=4)
+
+        eval_scores = evaluate_bleu(
+            examples=dataset['test'], gen_sents=gen_sents, tgt_key=tgt_key)
+        print(f'Epoch {epoch_idx}: {eval_scores}')
+
+        json.dump(
+            {'validation_loss': float(validation_loss), **eval_scores},
+            open(f'{workdir}/eval_results_epoch{epoch_idx}.json', 'w'))
 
 
 if __name__ == '__main__':

@@ -52,11 +52,37 @@ __global__ void ker_layer_norm(T *ln_res, T *vars, T *means, const T *inp,
     l_sum += val.x + val.y + val.z + val.w;
   }
 
-  // Step 2
+  float l_square_sum = 0;
+  for (uint idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+    float4 val = inp_f4[idx];
+    l_square_sum += val.x * val.x + val.y * val.y + val.z * val.z + val.w * val.w;
+  }
 
-  // Step 3
-  
-  assert(false && "Not Implemented");
+  float dim = float(hidden_size) * 4.f;
+  float sums[2] = {l_sum, l_square_sum};
+  blockReduce<ReduceType::kSum, 2>(sums);
+  __shared__ float mu, sigma;
+  if (threadIdx.x == 0) {
+    mu = sums[0] / dim;
+    if (means != nullptr) means[blockIdx.x] = mu;
+    sigma = sums[1] / dim - mu * mu + LN_EPSILON;
+    vars[blockIdx.x] = sigma;
+    sigma = rsqrtf(sigma);
+  }
+  __syncthreads();
+
+  float4 *out = reinterpret_cast<float4 *>(ln_res) + blockIdx.x * hidden_size;
+  for (uint i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+    float4 s = __ldg(reinterpret_cast<const float4 *>(scale) + i);
+    float4 b = __ldg(reinterpret_cast<const float4 *>(bias) + i);
+    float4 x = inp_f4[i];
+    x.x = (x.x - mu) * sigma * s.x + b.x;
+    x.y = (x.y - mu) * sigma * s.y + b.y; 
+    x.z = (x.z - mu) * sigma * s.z + b.z;
+    x.w = (x.w - mu) * sigma * s.w + b.w;
+    out[i] = x;
+  }
+
   /// END ASSIGN3_2
 }
 
@@ -178,14 +204,44 @@ __global__ void ker_ln_bw_dgamma_dbetta(T *gamma_grad, T *betta_grad,
   cg::thread_block_tile<TILE_DIM> g = cg::tiled_partition<TILE_DIM>(b);
 
   // Step 1
+  int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+	int idx = threadIdx.y * width + tidx;
+	float dbeta = 0;
+	float dgamma = 0;
+	if (tidx < width) {
+    for (int i = threadIdx.y; i < rows; i += TILE_DIM) {
+      float dout = float(out_grad[idx]);
+      float mu = means[i];
+      float var = vars[i];
+      float sigma = rsqrt(var + LN_EPSILON);
+      float xhat = (float(inp[idx] - mu)) * sigma;
+      dbeta += dout;
+      dgamma += xhat * dout;
+      idx += (TILE_DIM * width); // move to next index
+    }
+	}
 
   // Step 2
+  betta_buffer[threadIdx.x][threadIdx.y] = dbeta;
+	gamma_buffer[threadIdx.x][threadIdx.y] = dgamma;
+	__syncthreads();
+
+	float buffer_dbeta = betta_buffer[threadIdx.y][threadIdx.x];
+	float buffer_dgamma = gamma_buffer[threadIdx.y][threadIdx.x];
   
   // Step 3
+  for (int i = 1; i < TILE_DIM; i <<= 1) {
+		buffer_dbeta += g.shfl_down(buffer_dbeta, i);
+		buffer_dgamma += g.shfl_down(buffer_dgamma, i);
+	}
   
   // Step 4
+  if (threadIdx.x == 0 && tidx < width) {
+    int i = blockIdx.x * TILE_DIM + threadIdx.y;
+		betta_grad[i] = buffer_dbeta;
+		gamma_grad[i] = buffer_dgamma;
+	}
 
-  assert(false && "Not Implemented");
   /// END ASSIGN3_2
 }
 
@@ -233,14 +289,51 @@ __global__ void ker_ln_bw_dinp(T *inp_grad, const T *out_grad, const T *inp,
   // 4. Compute final gradient
   
   // Step 1
+  float4 dxhat, xhat;
+  int idx = blockIdx.x * hidden_dim + threadIdx.x;
+  int mv_idx = blockIdx.x;
+  const float4 dy = reinterpret_cast<const float4 *>(out_grad)[idx];
+  const float4 w = reinterpret_cast<const float4*>(gamma)[threadIdx.x];
+  dxhat.x = dy.x * w.x;
+  dxhat.y = dy.y * w.y;
+  dxhat.z = dy.z * w.z;
+  dxhat.w = dy.w * w.w;
  
   // Step 2
+  float mu = means[mv_idx];
+  float sigma = vars[mv_idx];
+  sigma = rsqrtf(sigma + LN_EPSILON);
+  xhat = reinterpret_cast<const float4 *>(inp)[idx];
+  xhat.x = (xhat.x - mu) * sigma;
+  xhat.y = (xhat.y - mu) * sigma;
+  xhat.z = (xhat.z - mu) * sigma;
+  xhat.w = (xhat.w - mu) * sigma;
+
+  float reduce[2] = {0.f, 0.f};
+  if (threadIdx.x < hidden_dim) {
+    reduce[0] = dxhat.x + dxhat.y + dxhat.z + dxhat.w;
+    reduce[1] = dxhat.x * xhat.x + dxhat.y * xhat.y + dxhat.z * xhat.z + dxhat.w * xhat.w;
+  }
    
   // Step 3
+  blockReduce<ReduceType::kSum, 2>(reduce);
+  __shared__ float s_dxhat;
+  __shared__ float s_dxhat_xhat;
+  if (threadIdx.x == 0) {
+      s_dxhat = reduce[0] / (hidden_dim * 4);
+      s_dxhat_xhat = reduce[1] / (hidden_dim * 4);
+  }
+  __syncthreads();
  
   // Step 4
+  if (threadIdx.x >= hidden_dim) return;
+  float4 dinp = dxhat;
+  dinp.x = (dxhat.x - s_dxhat - xhat.x * s_dxhat_xhat) * sigma;
+  dinp.y = (dxhat.y - s_dxhat - xhat.y * s_dxhat_xhat) * sigma;
+  dinp.z = (dxhat.z - s_dxhat - xhat.z * s_dxhat_xhat) * sigma;
+  dinp.w = (dxhat.w - s_dxhat - xhat.w * s_dxhat_xhat) * sigma;
+  ((float4 *)inp_grad)[idx] = dinp;
   
-  assert(false && "Not Implemented");
   /// END ASSIGN3_2
 }
 extern "C" {
