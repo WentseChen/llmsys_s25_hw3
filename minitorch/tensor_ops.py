@@ -99,7 +99,6 @@ class TensorBackend:
         self.layernorm_fw = ops.layernorm_fw
         self.layernorm_bw = ops.layernorm_bw
 
-
 class SimpleOps(TensorOps):
     @staticmethod
     def map(fn: Callable[[float], float]) -> MapProto:

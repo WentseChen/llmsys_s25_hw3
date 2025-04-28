@@ -210,7 +210,6 @@ class TensorData:
         else:
             raise TypeError(f"Unsupported index type: {type(index)}")
 
-
         # Pretend 0-dim shape is 1-dim shape of singleton
         shape = self.shape
         if len(shape) == 0 and len(aindex) != 0:

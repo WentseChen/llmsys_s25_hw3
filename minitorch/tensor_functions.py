@@ -671,3 +671,40 @@ def grad_check(f: Any, *vals: Tensor, tol=1e-6) -> None:
             1e-2,
             err_msg=err_msg % (f, vals, x.grad[ind], i, ind, check),
         )
+
+class Gather(Function):
+    @staticmethod
+    def forward(ctx: Context, a: Tensor, dim: int, index: Tensor) -> Tensor:
+        """
+        Gathers values along an axis specified by dim.
+        
+        Parameters:
+            ctx: The context for backpropagation
+            a: The input tensor
+            dim: The dimension along which to index
+            index: The indices of elements to gather
+            
+        Returns:
+            Tensor: A new tensor with values gathered from input
+        """
+        ctx.save_for_backward(a, index, dim)
+        return a.f.gather_fw(a, dim, index)
+
+    @staticmethod
+    def backward(ctx: Context, grad_output: Tensor) -> Tuple[Tensor, float, Tensor]:
+        """
+        Compute gradients for the gather operation.
+        
+        Parameters:
+            ctx: The context with saved tensors
+            grad_output: Gradient with respect to the output
+            
+        Returns:
+            Tuple containing gradients for input, dimension (0.0), and indices (zero tensor)
+        """
+        a, index, dim = ctx.saved_values
+        a_grad = a.zeros(a.shape)
+        a_grad = grad_output.f.gather_bw(grad_output, a_grad, dim, index)
+        # No gradient for dim (int) and zeros for index
+        index_grad = index.zeros(index.shape)
+        return a_grad, 0.0, index_grad

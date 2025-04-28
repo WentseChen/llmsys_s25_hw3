@@ -37,6 +37,7 @@ from .tensor_functions import (
     Tanh,
     Attn_Softmax,
     LayerNorm,
+    Gather,
 )
 
 if TYPE_CHECKING:
@@ -428,6 +429,18 @@ class Tensor:
   
   
     def gather(self, dim: int, index: Tensor) -> Tensor:
+        """
+        Gathers values along an axis specified by dim.
+        
+        Args:
+            dim (int): The axis along which to index
+            index (Tensor): The indices of elements to gather
+                
+        Returns:
+            Tensor: A new tensor with values gathered from self at the indices 
+                specified by index along dimension dim
+        """
+        # return Gather.apply(self, tensor(dim), index)
         def one_hot(input: Tensor, num_classes: int) -> Tensor:
             """Takes a Tensor containing indices of shape (*) and returns a tensor of shape (*, num_classes) 
             that contains zeros except a 1 where the index of last dimension matches the corresponding value of the input tensor.

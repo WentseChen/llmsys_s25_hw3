@@ -206,11 +206,11 @@ def loss_fn(batch, model, ref_model):
     rejected_input_ids.requires_grad_(True)
     rejected_labels = batch['rejected_labels']
     rejected_labels.requires_grad_(True)
-    rejected_label_token_weights = batch['rejected_label_token_weights']
+    rejected_label_token_weights = batch['label_token_weights']
     rejected_label_token_weights.requires_grad_(True)
     
     chosen_logits = model(idx=chosen_input_ids)
-    chosen_logp = minitorch.nn.softmax(chosen_logits, dim=-1)
+    chosen_logp = minitorch.nn.logsoftmax(chosen_logits, dim=2)
     chosen_labels_unsqueeze = chosen_labels.view(
         chosen_labels.shape[0], chosen_labels.shape[1], 1
     )
@@ -220,7 +220,7 @@ def loss_fn(batch, model, ref_model):
     )
     
     rejected_logits = model(idx=rejected_input_ids)
-    rejected_logp = minitorch.nn.softmax(rejected_logits, dim=-1)
+    rejected_logp = minitorch.nn.logsoftmax(rejected_logits, dim=2)
     rejected_labels_unsqueeze = rejected_labels.view(
         rejected_labels.shape[0], rejected_labels.shape[1], 1
     )
@@ -230,14 +230,14 @@ def loss_fn(batch, model, ref_model):
     )
     
     ref_chosen_logits = ref_model(idx=chosen_input_ids)
-    ref_chosen_logp = minitorch.nn.softmax(ref_chosen_logits, dim=-1)
+    ref_chosen_logp = minitorch.nn.logsoftmax(ref_chosen_logits, dim=2)
     ref_chosen_logp_unsqueeze = ref_chosen_logp.gather(2, chosen_labels_unsqueeze)
     ref_chosen_logp = ref_chosen_logp_unsqueeze.view(
         chosen_labels.shape[0], chosen_labels.shape[1]
     )
     
     ref_rejected_logits = ref_model(idx=rejected_input_ids)
-    ref_rejected_logp = minitorch.nn.softmax(ref_rejected_logits, dim=-1)
+    ref_rejected_logp = minitorch.nn.logsoftmax(ref_rejected_logits, dim=2)
     ref_rejected_logp_unsqueeze = ref_rejected_logp.gather(2, rejected_labels_unsqueeze)
     ref_rejected_logp = ref_rejected_logp_unsqueeze.view(
         rejected_labels.shape[0], rejected_labels.shape[1]
@@ -325,7 +325,7 @@ def train(model, ref_model, optimizer, examples, n_samples, collate_fn, batch_si
             lr=optimizer.lr)
 
 
-def evaluate_loss(model, examples, batch_size, collate_fn, desc):
+def evaluate_loss(model, ref_model, examples, batch_size, collate_fn, desc):
     """
     Evaluates the model on the provided examples and computes the average loss.
 
@@ -345,7 +345,7 @@ def evaluate_loss(model, examples, batch_size, collate_fn, desc):
     for i in (prog_bar := tqdm.trange(
         0, len(examples), batch_size, desc=f'Evaluating ({desc})')):
         batch = collate_fn(examples=examples[i:i + batch_size])
-        loss = loss_fn(batch=batch, model=model)
+        loss = loss_fn(batch=batch, model=model, ref_model=ref_model)
 
         losses.append(loss.item())
         prog_bar.set_postfix(loss=loss.item())
@@ -511,6 +511,7 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
 
         validation_loss = evaluate_loss(
             model=model,
+            ref_model=ref_model,
             examples=dataset['validation'],
             batch_size=batch_size,
             collate_fn=collate_fn,
